@@ -301,3 +301,46 @@ vec 时间理论降 ~25%（待记分板/pipe 复测）。
   越多摊得越薄——与小 shape 收益小、大 shape 收益大的记分板一致。
 - scalar 占比升至 22.4%（分母缩小所致，绝对时长未变）→ R3 的标量域
   消除动机保留，但部分标量成本已被流水掩盖，优先级下调。
+
+## 第 4 轮（R4）：routed 行级负载再分配（2026-10-08）
+
+### 设计
+
+0.2 节的病灶：grouped 路径按 expert 串行 ProcessGroup，每组 `ceil(组行数/40)`
+个核干活，decode（每 expert 1 至 2 行）时墙钟 = 14 × (48KB 参数 + 单行全链)
+≈ 44µs 压在 block0，其余核空转。
+
+改为**行级均摊**：`rowsPerCore = ceil(rowLen/usedCoreNum)` 对全体行分配，
+每核用标量游标（group_index 的 E 次读，同旧版总量）按行解析所属 expert，
+仅在游标跨 expert 时重载 weight_scale/bias（TQue 深度 1，先 Free 旧再
+CopyIn 新）：
+
+- 游标扫描与参数加载分离——跳过的零行组不触发参数拷贝；
+- `ReadExpertRows` 保留旧版的 remaining 钳制语义（尾部超量吸收进最后
+  非空组）；
+- 非分组 int32（expertNum=1）与 bf16 走同一段行循环，constexpr 剔除
+  参数段，行为与旧版逐位一致；
+- depth=2 的 x 预取在游标推进前发出，参数重载的 MTE2 停等与下一行
+  x 拷贝重叠。
+
+每行计算输入（x、该行 expert 的 weight_scale/bias、activation_scale）
+与旧版完全相同——位级等价，只动调度。
+
+### 结果
+
+- **精度**：16/16 全绿（含零行组、非均匀 prefill 边界、全 TP 档）。
+- **记分板**（NPUGraph，µs，R2 → R4）：
+
+| shape | R2 | R4 | Δ vs R2 | 累计 vs 基线 |
+|---|---|---|---|---|
+| **routed rows=16（decode）** | 38.46 | **6.89** | **-82.1%** | **-82.9%（5.8x）** |
+| routed rows=1040 | 73.72 | 64.03 | -13.1% | -20.7% |
+| routed rows=65536 | 3531.96 | 3495.33 | -1.0% | -20.6% |
+| shared / bf16 全档 | — | — | ±2% 噪声 | 不变 |
+
+- **pipe 复测**（routed rows=16）：Task Duration 40µs 级 → **7.24µs**；
+  block0 aiv_time 44.16 → 4.74µs，16 核全部 4.5 至 6.5µs（vec 0.41 至 0.46、
+  scalar 0.46 至 0.54）——「一核独扛、余核看戏」变为均摊。
+- decode 墙钟残量 ≈ 单行全链 2.5µs + 48KB expert 参数搬运 ~1µs + launch，
+  已贴近单行成本地板；进一步压需要参数在核间共享（做不到，MTE2 各核
+  独立）或减少单行 pass 数（R1 已做）。

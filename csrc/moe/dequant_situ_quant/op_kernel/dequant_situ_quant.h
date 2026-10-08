@@ -787,47 +787,33 @@ public:
             return;
         }
 
-        if constexpr (!std::is_same_v<XType, int32_t>) {
-            ProcessGroup(0, rowLen_, 0);
-            return;
-        }
-
-        if (!hasGroupIndex_) {
-            ProcessGroup(0, rowLen_, 0);
-            return;
-        }
-
-        int64_t groupOffset = 0;
-        for (int64_t expertIdx = 0; expertIdx < expertNum_ && groupOffset < rowLen_; ++expertIdx) {
-            const int64_t requestedRows = groupIndexGm_.GetValue(expertIdx);
-            const int64_t remainingRows = rowLen_ - groupOffset;
-            const int64_t groupRows = requestedRows <= 0 ? 0 :
-                (requestedRows > remainingRows ? remainingRows : requestedRows);
-            if (groupRows > 0) {
-                ProcessGroup(expertIdx, groupRows, groupOffset);
-                groupOffset += groupRows;
-            }
-        }
-    }
-
-private:
-    __aicore__ inline void ProcessGroup(int64_t expertIdx, int64_t groupRows, int64_t groupOffset)
-    {
-        const int64_t rowsPerCore = (groupRows + usedCoreNum_ - 1) / usedCoreNum_;
-        const int64_t localGroupOffset = blockIdx_ * rowsPerCore;
-        if (localGroupOffset >= groupRows) {
+        // Row-major assignment over the full row set, independent of expert
+        // boundaries: decode shapes with 1-2 rows per expert no longer
+        // serialize every expert on the first core. Each core resolves its
+        // rows' expert with a scalar cursor over group_index and reloads
+        // per-expert params only when the cursor crosses an expert.
+        const int64_t rowsPerCore = (rowLen_ + usedCoreNum_ - 1) / usedCoreNum_;
+        const int64_t firstRow = blockIdx_ * rowsPerCore;
+        if (firstRow >= rowLen_) {
             return;
         }
         const int64_t localRows =
-            groupRows - localGroupOffset < rowsPerCore ? groupRows - localGroupOffset : rowsPerCore;
-        const int64_t firstRow = groupOffset + localGroupOffset;
+            rowLen_ - firstRow < rowsPerCore ? rowLen_ - firstRow : rowsPerCore;
 
+        int64_t expertCursor = 0;
+        int64_t expertStart = 0;
+        int64_t expertRows = 0;
         if constexpr (std::is_same_v<XType, int32_t>) {
-            CopyInExpertParams(expertIdx);
-            weightScaleLocal_ = weightScaleQueue_.DeQue<float>();
-            if (hasBias_) {
-                biasLocal_ = biasQueue_.DeQue<float>();
+            if (hasGroupIndex_) {
+                expertRows = ReadExpertRows(expertCursor, expertStart);
+                while (expertCursor + 1 < expertNum_ &&
+                       firstRow >= expertStart + expertRows) {
+                    expertStart += expertRows;
+                    ++expertCursor;
+                    expertRows = ReadExpertRows(expertCursor, expertStart);
+                }
             }
+            LoadExpertParams(expertCursor);
         }
 
         if (localRows > 0) {
@@ -846,14 +832,67 @@ private:
                 // iteration (the prologue only covered localRow 0).
                 CopyInRow(rowIdx);
             }
+            if constexpr (std::is_same_v<XType, int32_t>) {
+                if (hasGroupIndex_) {
+                    while (expertCursor + 1 < expertNum_ &&
+                           rowIdx >= expertStart + expertRows) {
+                        expertStart += expertRows;
+                        ++expertCursor;
+                        expertRows = ReadExpertRows(expertCursor, expertStart);
+                    }
+                    if (expertCursor != paramsExpert_) {
+                        LoadExpertParams(expertCursor);
+                    }
+                }
+            }
             ComputeRow(rowIdx);
             CopyOutRow(rowIdx);
         }
 
         if constexpr (std::is_same_v<XType, int32_t>) {
-            weightScaleQueue_.FreeTensor(weightScaleLocal_);
+            FreeExpertParams();
+        }
+    }
+
+private:
+    // group_index[expert] row count clamped to the rows that still exist,
+    // mirroring the previous per-expert clamping semantics.
+    __aicore__ inline int64_t ReadExpertRows(int64_t expert, int64_t expertStart)
+    {
+        const int64_t requested = groupIndexGm_.GetValue(expert);
+        const int64_t remaining = rowLen_ - expertStart;
+        return requested <= 0 ? 0 : (requested > remaining ? remaining : requested);
+    }
+
+    __aicore__ inline void LoadExpertParams(int64_t expertIdx)
+    {
+        if constexpr (std::is_same_v<XType, int32_t>) {
+            if (paramsLoaded_) {
+                weightScaleQueue_.FreeTensor(weightScaleLocal_);
+                if (hasBias_) {
+                    biasQueue_.FreeTensor(biasLocal_);
+                }
+            }
+            CopyInExpertParams(expertIdx);
+            weightScaleLocal_ = weightScaleQueue_.DeQue<float>();
             if (hasBias_) {
-                biasQueue_.FreeTensor(biasLocal_);
+                biasLocal_ = biasQueue_.DeQue<float>();
+            }
+            paramsLoaded_ = true;
+            paramsExpert_ = expertIdx;
+        }
+    }
+
+    __aicore__ inline void FreeExpertParams()
+    {
+        if constexpr (std::is_same_v<XType, int32_t>) {
+            if (paramsLoaded_) {
+                weightScaleQueue_.FreeTensor(weightScaleLocal_);
+                if (hasBias_) {
+                    biasQueue_.FreeTensor(biasLocal_);
+                }
+                paramsLoaded_ = false;
+                paramsExpert_ = -1;
             }
         }
     }
@@ -1089,6 +1128,8 @@ private:
     LocalTensor<float> weightScaleLocal_;
     LocalTensor<float> biasLocal_;
     int32_t rowDbDepth_ = 1;
+    bool paramsLoaded_ = false;
+    int64_t paramsExpert_ = -1;
 };
 
 } // namespace DequantSituQuantOps
