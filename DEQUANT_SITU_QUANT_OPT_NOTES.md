@@ -344,3 +344,53 @@ CopyIn 新）：
 - decode 墙钟残量 ≈ 单行全链 2.5µs + 48KB expert 参数搬运 ~1µs + launch，
   已贴近单行成本地板；进一步压需要参数在核间共享（做不到，MTE2 各核
   独立）或减少单行 pass 数（R1 已做）。
+
+## 第 3 轮（R3）评估：标量域消除 —— 缓做（2026-10-08）
+
+两个子项均评估后决定不进本轮，理由记录如下（避免后续重复推导）：
+
+- **R3a activation_scale 广播**（int32 路径每行
+  `activationScaleGm_.GetValue(rowIdx)` → Process 起点批量 MTE2 进 UB +
+  Gather 8 元素块 + 块广播 Mul）：位级等价可行（Muls→块广播 Mul 同为
+  V 拍乘法，antiquant_c220/主 kernel 有先例）。但只惠及 int32 两族
+  （bf16 主力族无此标量读），shared int32 的 scalar 占比仅 8.5 至 9.2%，
+  且 GetValue 的 GM 延迟已被与 Mul(weightScale) 的发射重叠部分掩盖——
+  预期收益 2 至 7%，收益/风险比不足。
+- **R3b V_S 往返向量化**（Div(ones, scale) 留向量域 + 零保护）：零保护
+  需要 float Compare/Select，**c220 上仓内无先例**（float Compare 只有
+  arch35 MicroAPI 用法；v220 掩码张量的 U dtype 语义需实测），试错
+  成本高于预期收益（bf16 scalar 22.4% 中 V_S 停等仅一部分，且 R2 流水
+  已部分掩盖）。若后续要做：先写单测探针验证 Compare<float> 的掩码
+  dtype（uint8 对 8 元素块）再动 kernel。
+
+## 边界语义备注（R4 行为变化，仅限非法输入）
+
+旧 grouped 路径对 `sum(group_index) < rowLen` 的非法输入：尾部行
+[sum, rowLen) 不被任何 expert 处理（y 保持 GM 原值）。新行级均摊路径：
+游标停在最后一个 expert，尾部行按该 expert 的参数处理（有确定输出）。
+生产契约恒 rowLen == sum（vllm_ascend 构造侧保证），tiling 侧无此断言；
+如需严格复刻旧行为可在 cursor 到达 expertNum-1 且 expertStart+expertRows
+< rowLen 时截断 localRows。
+
+## 收官记分板（NPUGraph replay，µs，5 样本中位）
+
+| shape | 基线 | R1 | R2 | R4 | 累计 |
+|---|---|---|---|---|---|
+| routed rows=16（decode） | 40.22 | 38.02 | 38.46 | **6.89** | **-82.9%（5.8x）** |
+| routed rows=1040 | 80.70 | 76.09 | 73.72 | 64.03 | -20.7% |
+| routed rows=65536 | 4400.47 | 4176.17 | 3531.96 | 3495.33 | -20.6% |
+| bf16 rows=1 | 3.73 | 3.71 | 3.82 | 4.03 | +8%（噪声带） |
+| bf16 rows=16 | 5.67 | 5.26 | 5.80 | 5.78 | +2%（噪声带） |
+| bf16 rows=1040 | 63.59 | 60.20 | 54.68 | 55.56 | -12.6% |
+| bf16 rows=4096 | 231.74 | 220.57 | 197.09 | 197.06 | -14.9% |
+| shared rows=1 2H=12288 | 5.83 | 5.53 | 5.88 | 5.89 | +1%（噪声带） |
+| shared rows=1024 2H=12288 | 110.89 | 104.13 | 105.75 | 105.40 | -5.0% |
+| shared rows=1024 2H=6144 | 69.40 | 65.21 | 60.49 | 60.46 | -12.9% |
+| shared rows=4096 2H=6144 | 251.48 | 237.88 | 214.89 | 214.14 | -14.8% |
+
+（rows≤16 各档在 ±8% 噪声带内，单次采样的 launch/宿主抖动主导；
+深度门控后这些 shape 的 kernel 行为与基线一致。）
+
+四轮全绿：每轮 16/16 精度（含零行组、非均匀组、全 TP 档、混合行数核）。
+战役提交：44ad0bf1f（基线）→ a436ae045（R1）→ 4d47103a8（R2）→
+8d3e562d7（R4）。
