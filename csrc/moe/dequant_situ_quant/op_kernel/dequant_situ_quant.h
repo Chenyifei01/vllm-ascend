@@ -775,7 +775,7 @@ public:
             pipe_->InitBuffer(dequantBuf_, inputWidth_ * static_cast<int64_t>(sizeof(float)));
         }
         pipe_->InitBuffer(outQueue_, 1, outputBytes);
-        pipe_->InitBuffer(tmpBuf_, inputWidth_ * static_cast<int64_t>(sizeof(float)));
+        pipe_->InitBuffer(tmpBuf_, (inputWidth_ + 8) * static_cast<int64_t>(sizeof(float)));
     }
 
     __aicore__ inline void Process()
@@ -899,28 +899,49 @@ private:
 
         LocalTensor<float> gate = xLocalF32[gateOffset];
         LocalTensor<float> up = xLocalF32[upOffset];
-        LocalTensor<float> sigmoid = temp;
-        LocalTensor<float> ones = temp[outputWidth_];
+        // temp layout: [0:H) denom = 1 + exp(-gate); [H,2H) sigmoid;
+        // [inputWidth_, +8) ones block feeding the stride-0 broadcast Div.
+        LocalTensor<float> denom = temp;
+        LocalTensor<float> sigmoid = temp[outputWidth_];
+        LocalTensor<float> ones = temp[inputWidth_];
 
-        Adds(sigmoid, gate, 0.0f, outputWidth_);
+        Muls(denom, gate, -1.0f, outputWidth_);
         PipeBarrier<PIPE_V>();
-        Muls(gate, gate, 1.0f / beta_, outputWidth_);
-        PipeBarrier<PIPE_V>();
+        // beta == 1 makes both Muls a bit-exact identity; skip them.
+        if (beta_ != 1.0f) {
+            Muls(gate, gate, 1.0f / beta_, outputWidth_);
+            PipeBarrier<PIPE_V>();
+        }
         Tanh(gate, gate, outputWidth_);
         PipeBarrier<PIPE_V>();
-        Muls(gate, gate, beta_, outputWidth_);
+        if (beta_ != 1.0f) {
+            Muls(gate, gate, beta_, outputWidth_);
+            PipeBarrier<PIPE_V>();
+        }
+
+        Exp(denom, denom, outputWidth_);
+        PipeBarrier<PIPE_V>();
+        Adds(denom, denom, 1.0f, outputWidth_);
+        PipeBarrier<PIPE_V>();
+        Duplicate<float>(ones, 1.0f, 8);
         PipeBarrier<PIPE_V>();
 
-        Muls(sigmoid, sigmoid, -1.0f, outputWidth_);
-        PipeBarrier<PIPE_V>();
-        Exp(sigmoid, sigmoid, outputWidth_);
-        PipeBarrier<PIPE_V>();
-        Adds(sigmoid, sigmoid, 1.0f, outputWidth_);
-        PipeBarrier<PIPE_V>();
-        Duplicate<float>(ones, 1.0f, outputWidth_);
-        PipeBarrier<PIPE_V>();
-        Div(sigmoid, ones, sigmoid, outputWidth_);
-        PipeBarrier<PIPE_V>();
+        // sigmoid = 1 / (1 + exp(-gate)), src0 broadcast from a single 32B
+        // block (src0BlkStride=0, src0RepStride=0). Div writes to a buffer
+        // distinct from src1 to avoid in-place dst==src1 on this device.
+        constexpr uint64_t divMask = static_cast<uint64_t>(K3_MASK_FP32);
+        uint32_t fullReps = static_cast<uint32_t>(outputWidth_ / K3_MASK_FP32);
+        uint32_t remainder = static_cast<uint32_t>(outputWidth_ % K3_MASK_FP32);
+        BinaryRepeatParams divParams(1, 0, 1, 8, 0, 8);
+        if (fullReps > 0) {
+            Div(sigmoid, ones, denom, divMask, static_cast<uint8_t>(fullReps), divParams);
+            PipeBarrier<PIPE_V>();
+        }
+        if (remainder > 0) {
+            Div(sigmoid[fullReps * K3_MASK_FP32], ones,
+                denom[fullReps * K3_MASK_FP32], remainder, 1, divParams);
+            PipeBarrier<PIPE_V>();
+        }
         Mul(gate, gate, sigmoid, outputWidth_);
         PipeBarrier<PIPE_V>();
 
@@ -944,9 +965,6 @@ private:
         Abs(temp, situ, outputWidth_);
         PipeBarrier<PIPE_V>();
         ComputeReduceMax(temp);
-        PipeBarrier<PIPE_V>();
-        WholeReduceMax(temp, temp, K3_MASK_FP32, 1, K3_MASK_BLK_STRIDE, 1, K3_MASK_BLK_STRIDE,
-                       ReduceOrder::ORDER_ONLY_VALUE);
         PipeBarrier<PIPE_V>();
 
         event_t eventVToS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));

@@ -175,3 +175,69 @@ shared/routed/bf16 三模式）；数据见 profiling_dsq_situ_baseline/bench_ba
 - **R3 标量域消除**：视 R2 后 scalar 占比决定（V_S 往返可被流水掩盖则降级）。
 - **R4 routed 负载再分配**：行级均摊 + 按 expert 参数按需搬运；事件/标志
   契约按 skill 910B 要点走，重点验证混合组行数边界（0 行组、组行数 < 核数）。
+
+## 第 1 轮（R1）：消冗余 pass（2026-10-08）
+
+改动范围：仅 `op_kernel/dequant_situ_quant.h` 的 K3Kernel（int32/bf16 生产
+路径）；int8 旧 kernel 无生产调用方，不动（作未改路径对照）。
+
+四处位级等价消减：
+
+1. **`Adds(sigmoid, gate, 0.0f)` 拷贝 pass 删除**——原序列
+   copy-then-`Muls(-1)` 两拍改为 `Muls(denom, gate, -1.0f)` 一拍。
+   -0.0/+0.0 符号差经 `Exp/Adds(+1)` 后无观测路径，下游位级一致。
+2. **β=1 跳过 `Muls(gate, 1/β)`/`Muls(gate, β)`**——×1.0f 为 IEEE 位级
+   恒等；bf16 生产调用（w4a8.py）恒传 β=1.0，省 2 个 H 宽 pass。β=4 的
+   int32 路径不受影响。
+3. **每行 `Duplicate(ones, 1.0f, H)` + `Div(sigmoid, ones, sigmoid, H)`**
+   改为 8 元素 ones 块 + stride-0 广播 Div（`BinaryRepeatParams(1,0,1,8,0,8)`，
+   main kernel ComputeSitu 同款官方范式），每行省 1 个 H 宽 pass。
+   同时 Div 的 dst（temp[H:2H)）与 src1（denom，temp[0:H)）分离到不同
+   缓冲——规避 c220 dst==src1 风险（skill 记忆：交错累加 fault）。
+   tmpBuf_ 相应扩 8 float（int32 shared TP1 最大 UB 占用 150KB→150.03KB，
+   192KB 预算内充裕）。
+4. **`DynamicQuant` 双重 `WholeReduceMax` 去一**——ComputeReduceMax 内部
+   已以同参数收尾，外层那次是幂等重复。
+
+每行 pass 数：int32 路径 21→18；bf16 路径（β=1、无 linearβ）15→11，
+vec 时间理论降 ~25%（待记分板/pipe 复测）。
+
+### R1 结果（2026-10-08，commit 待填）
+
+- **精度**：16/16 全绿（改动后同套用例）。
+- **构建自检**：repo 源 == build 树源（md5 15f5130c…）；vendored .o 09:01 刷新。
+  本轮仅动 kernel，build 已把产物装入仓内 `vllm_ascend/_cann_ops_custom`
+  （enable_custom_op 的实际加载路径），故跳过 pip install（与 skill 流程的
+  一次偏离，记录在案）。
+- **记分板**（NPUGraph，µs，基线 → R1）：
+
+| shape | 基线 | R1 | Δ |
+|---|---|---|---|
+| shared rows=1 2H=12288 | 5.83 | 5.53 | -5.1% |
+| shared rows=16 2H=12288 | 7.97 | 7.43 | -6.8% |
+| shared rows=128 2H=12288 | 23.91 | 22.08 | -7.7% |
+| shared rows=1024 2H=12288 | 110.89 | 104.13 | -6.1% |
+| shared rows=2048 2H=12288 | 213.63 | 200.88 | -6.0% |
+| shared rows=1024 2H=6144 | 69.40 | 65.21 | -6.0% |
+| shared rows=4096 2H=6144 | 251.48 | 237.88 | -5.4% |
+| routed rows=16 | 40.22 | 38.02 | -5.5% |
+| routed rows=1040 | 80.70 | 76.09 | -5.7% |
+| routed rows=65536 | 4400.47 | 4176.17 | -5.1% |
+| bf16 rows=1 | 3.73 | 3.71 | -0.5% |
+| bf16 rows=16 | 5.67 | 5.26 | -7.2% |
+| bf16 rows=1040 | 63.59 | 60.20 | -5.3% |
+| bf16 rows=4096 | 231.74 | 220.57 | -4.8% |
+
+（中间档位同向，全表见 profiling_dsq_situ_r1/bench_r1.json；ref 列有 ±3%
+抖动属宿主噪声，比值取同次运行内。）
+
+- **pipe 复测**：bf16_1040 aiv_time 65.1→63.5µs，vec 75.0→72.9%、
+  scalar 15.4→17.2%（总时长缩短后固定标量成本占比反升）；shared_1040
+  aiv 116.5→111.1µs，vec 78.0→76.7%。vec 占比降幅小于 pass 数降幅
+  （-25% 理论值）——**被消的都是廉价 pass（Muls/Add/Duplicate 每周期
+  64 lane），昂贵的 Tanh/Exp/Div 原样保留**；进一步压 vec 时间需要
+  R2 流水重叠把 MTE2/标量藏进 vec，或算法级减少超越函数（无数值等价
+  途径，不做）。
+- **tiling key 设备实证**：bf16 路径 = `DequantSituQuant_f54a…_40000`，
+  int32 路径（shared 与 routed 共用）= `DequantSituQuant_155c…_30000`，
+  Block Dim=40（rows≥40 时）；msprof OpBasicInfo 与本次采集一致。
