@@ -241,3 +241,63 @@ vec 时间理论降 ~25%（待记分板/pipe 复测）。
 - **tiling key 设备实证**：bf16 路径 = `DequantSituQuant_f54a…_40000`，
   int32 路径（shared 与 routed 共用）= `DequantSituQuant_155c…_30000`，
   Block Dim=40（rows≥40 时）；msprof OpBasicInfo 与本次采集一致。
+
+## 第 2 轮（R2）：行间双缓冲流水（2026-10-08）
+
+### 设计
+
+- xQueue_/outQueue_ 深度 1→2（TQue 模板上限 2，InitBuffer 深度运行期取自
+  tiling `isDoubleBuffer`）；行循环改 prologue + 预取：
+  `prologue CopyIn(row0)` → 每轮 `[depth=2 时先 CopyIn(row+1)] → Compute(row) → CopyOut(row)`，
+  下一行的 MTE2 拷贝与当前行的 V 计算重叠。
+- **tiling 定深度**（CalcTiling，int32/bf16 分支）：按 kernel InitBuffer 布局
+  精确核算 UB——`2×(xSlot+outSlot) + paramSlot(weight_scale/dequant+bias) +
+  tmpSlot(2H+8 float) + 1024 ≤ ubSize` 才给 2，否则 1（行数不足时不许 prefetch，
+  depth=1 AllocTensor 会卡死在占用槽上）。
+- **每核行数门控**：`inDimx / usedCoreNum ≥ 2` 才启用——每核 1 行时
+  prefetch 无行可预取，纯增开销。
+- depth=1 路径保持旧时序（prologue 只覆盖首行，循环内重发当前行 CopyIn）。
+
+### 踩坑记录（aivec 异常一次）
+
+首版行循环 depth=1 时漏发循环内 CopyIn（prologue 拷了首行，后续行 DeQue
+空队列）→ `prefill_m65-tp1`（rows=65、2H=12288、每核 2 行、depth=1）aivec
+异常（MTE 非法地址 0x203000622），16 测试 6 红；后续 tp2-16 与 zero_routed
+为设备毒化连坐。修复：depth 分支，depth=1 循环内重发 CopyIn。
+**教训：改行循环时必须逐深度核对每行的 CopyIn 恰好一次**（skill「事件
+四件套/发射条件=消费条件」的行循环版）。
+
+12288×int32（shared TP1）恒 depth=1：UB 需求 210KB > 192KB，无法双缓冲
+（bench 中该族无收益、亦无回退，符合预期）。
+
+### 结果
+
+- **精度**：16/16 全绿。
+- **记分板**（NPUGraph，µs，R1 → R2）：
+
+| shape | R1 | R2 | Δ vs R1 | 累计 vs 基线 |
+|---|---|---|---|---|
+| routed rows=65536 | 4176.17 | 3531.96 | **-15.4%** | **-19.7%** |
+| bf16 rows=4096 | 220.57 | 197.09 | -10.6% | -14.9% |
+| shared rows=4096 2H=6144 | 237.88 | 214.89 | -9.6% | -14.6% |
+| bf16 rows=1040 | 60.20 | 54.68 | -9.2% | -14.0% |
+| shared rows=1024 2H=6144 | 65.21 | 60.49 | -7.2% | -12.8% |
+| routed rows=1040 | 76.09 | 73.72 | -3.1% | -8.7% |
+| shared rows=128 2H=6144 | 16.05 | 15.44 | -3.8% | -11.2% |
+| shared 2H=12288 全档（depth=1） | — | — | ±2% 噪声 | -5% 均为 R1 所得 |
+| rows≤40（每核 1 行，depth=1） | — | — | 噪声内 | 同基线 |
+
+（全表见 profiling_dsq_situ_r2/bench_r2b.json；收益随每核行数单调增——
+预取占比 = (每核行数-1)/行数，与理论一致。）
+
+- **pipe 复测**（bf16 rows=1040）：msprof Task Duration 65.96 → 55.54µs
+  （-15.8%）；PipeUtilization 三流水合计 **95.9%（基线）→ 114.7%**——
+  vec 84.3% + mte2 22.9% + mte3 7.5%，MTE2 大量藏入 V，重叠成立。
+- **流水图 trace**（rows=128 bf16，4 行/核，traces/dsq_situ_{pre,post}R2_bf16_128/）：
+  post-R2 时间线中 row1/row2 的 MTE2 拷贝（ts 1.44/1.85µs）落入 V 实质
+  计算窗口（VCONV 起 ts 2.05µs）内执行；core0 par(vec+mte) 1.12 → 0.96，
+  VECTOR 忙 8.2 → 7.0µs。rows=128 墙钟几乎未动的原因：启动期 ~1.6µs
+  标量发射空窗（0.43µs row0 数据就绪 → 2.05µs 才开始算）主导，行数
+  越多摊得越薄——与小 shape 收益小、大 shape 收益大的记分板一致。
+- scalar 占比升至 22.4%（分母缩小所致，绝对时长未变）→ R3 的标量域
+  消除动机保留，但部分标量成本已被流水掩盖，优先级下调。

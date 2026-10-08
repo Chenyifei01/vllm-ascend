@@ -765,7 +765,10 @@ public:
         const int64_t inputBytes = inputWidth_ * static_cast<int64_t>(sizeof(XType));
         const int64_t paramBytes = inputWidth_ * static_cast<int64_t>(sizeof(float));
         const int64_t outputBytes = outputWidth_ * static_cast<int64_t>(sizeof(int8_t)) + 32;
-        pipe_->InitBuffer(xQueue_, 1, inputBytes);
+        // Row double-buffer depth comes from tiling (UB-budget gated); the
+        // row loop prefetches the next row only when this is 2.
+        rowDbDepth_ = (tilingData->isDoubleBuffer == 2) ? 2 : 1;
+        pipe_->InitBuffer(xQueue_, rowDbDepth_, inputBytes);
         if constexpr (std::is_same_v<XType, int32_t>) {
             pipe_->InitBuffer(weightScaleQueue_, 1, paramBytes);
             if (hasBias_) {
@@ -774,7 +777,7 @@ public:
         } else {
             pipe_->InitBuffer(dequantBuf_, inputWidth_ * static_cast<int64_t>(sizeof(float)));
         }
-        pipe_->InitBuffer(outQueue_, 1, outputBytes);
+        pipe_->InitBuffer(outQueue_, rowDbDepth_, outputBytes);
         pipe_->InitBuffer(tmpBuf_, (inputWidth_ + 8) * static_cast<int64_t>(sizeof(float)));
     }
 
@@ -827,9 +830,22 @@ private:
             }
         }
 
+        if (localRows > 0) {
+            CopyInRow(firstRow);
+        }
         for (int64_t localRow = 0; localRow < localRows; ++localRow) {
             const int64_t rowIdx = firstRow + localRow;
-            CopyInRow(rowIdx);
+            if (rowDbDepth_ >= 2) {
+                // Prefetch the next row so its MTE2 copy overlaps this row's
+                // vector compute (needs the spare x slot of double buffer).
+                if (localRow + 1 < localRows) {
+                    CopyInRow(rowIdx + 1);
+                }
+            } else if (localRow > 0) {
+                // Depth 1: re-issue the copy for the current row each
+                // iteration (the prologue only covered localRow 0).
+                CopyInRow(rowIdx);
+            }
             ComputeRow(rowIdx);
             CopyOutRow(rowIdx);
         }
@@ -1064,14 +1080,15 @@ private:
     GlobalTensor<int8_t> yGm_;
     GlobalTensor<float> scaleGm_;
 
-    TQue<QuePosition::VECIN, 1> xQueue_;
+    TQue<QuePosition::VECIN, 2> xQueue_;
     TQue<QuePosition::VECIN, 1> weightScaleQueue_;
     TQue<QuePosition::VECIN, 1> biasQueue_;
-    TQue<QuePosition::VECOUT, 1> outQueue_;
+    TQue<QuePosition::VECOUT, 2> outQueue_;
     TBuf<TPosition::VECCALC> tmpBuf_;
     TBuf<TPosition::VECCALC> dequantBuf_;
     LocalTensor<float> weightScaleLocal_;
     LocalTensor<float> biasLocal_;
+    int32_t rowDbDepth_ = 1;
 };
 
 } // namespace DequantSituQuantOps

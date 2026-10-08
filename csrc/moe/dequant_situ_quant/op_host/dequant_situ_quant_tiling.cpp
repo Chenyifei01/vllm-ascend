@@ -545,11 +545,30 @@ bool DequantSituQuantTiling::CalcTiling(const uint32_t totalCores, const uint64_
     if (xDtype_ == ge::DT_INT32 || xDtype_ == ge::DT_BF16) {
         // INT32/BF16 path: no column tiling, whole row in UB
         tilingData.set_is32BAligned(1);
-        tilingData.set_isDoubleBuffer(1);
         tilingData.set_baseRowLen(1);
         tilingData.set_baseColLen(static_cast<uint32_t>(outDimy));
         totalUsedCoreNum = inDimx == 0 ? 0 : std::min(static_cast<uint32_t>(inDimx), totalCore);
         tilingData.set_usedCoreNum(totalUsedCoreNum);
+        // Row double-buffer depth: 2 when two in-flight rows plus the
+        // resident buffers fit UB, else 1 (rows stay serial). Must mirror
+        // the kernel's InitBuffer layout: xQueue/outQueue per slot, one
+        // weight-scale (int32) or dequant (bf16) buffer, bias (int32 only),
+        // and the (input+8)-float temp buffer.
+        const int64_t dtypeLen = (xDtype_ == ge::DT_INT32) ? 4 : 2;
+        const int64_t xSlot = inDimy * dtypeLen;
+        const int64_t outSlot = outDimy + static_cast<int64_t>(BLOCK_BYTES);
+        int64_t paramSlot = inDimy * static_cast<int64_t>(sizeof(float));
+        if (xDtype_ == ge::DT_INT32 && tilingData.get_dequantBiasIsEmpty() == 0) {
+            paramSlot += inDimy * static_cast<int64_t>(sizeof(float));
+        }
+        const int64_t tmpSlot = (inDimy + 8) * static_cast<int64_t>(sizeof(float));
+        const int64_t doubleNeed =
+            2 * (xSlot + outSlot) + paramSlot + tmpSlot + static_cast<int64_t>(UB_RESERVED_BUFF);
+        // Prefetch only pays off when a core holds at least two rows.
+        const bool multiRowPerCore = totalUsedCoreNum > 0 &&
+            inDimx / static_cast<int64_t>(totalUsedCoreNum) >= 2;
+        tilingData.set_isDoubleBuffer(
+            (multiRowPerCore && doubleNeed <= static_cast<int64_t>(ubSize)) ? 2 : 1);
         return true;
     }
 
